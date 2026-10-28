@@ -120,8 +120,7 @@ bool CR_HandleCloudRpc(const char* method, uint32_t appId,
                 }).detach();
             }
             LOG("[CR_API] ExitSyncDone app=%u", appId);
-            if (MetadataSync::syncPlaytime.load(std::memory_order_relaxed))
-                StatsStore::EndSession(appId);
+            StatsStore::EndSession(appId);
         }
         *respLen = 0;
         *eresult = 1;

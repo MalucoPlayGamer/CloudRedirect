@@ -188,11 +188,7 @@ std::string CmdListRemoteApps(const std::string& provider, const std::string& ac
 
     // List app folders first, then per-app stats (avoids heavy recursive listing).
     std::string prefix = accountId + "/";
-    std::vector<std::string> appIds;
-    if (!prov->ListSubfoldersChecked(prefix, appIds)) {
-        prov->Shutdown();
-        return JsonError("Failed to list apps for account " + accountId);
-    }
+    auto appIds = prov->ListSubfolders(prefix);
     std::map<std::string, std::pair<int, uint64_t>> appStats; // appId -> (count, totalSize)
     for (const auto& appId : appIds) {
         if (appId.empty()) continue;
@@ -253,11 +249,7 @@ std::string CmdListRemoteAppIds(const std::string& provider, const std::string& 
     }
     
     std::string prefix = accountId + "/";
-    std::vector<std::string> folders;
-    if (!prov->ListSubfoldersChecked(prefix, folders)) {
-        prov->Shutdown();
-        return JsonError("Failed to list apps for account " + accountId);
-    }
+    auto folders = prov->ListSubfolders(prefix);
     prov->Shutdown();
     
     // Build JSON array of app IDs
@@ -1020,11 +1012,7 @@ std::string CmdScanAll(const std::string& provider) {
     out << "[";
     bool firstApp = true;
     for (const auto& acct : accountIds) {
-        std::vector<std::string> appIds;
-        if (!prov->ListSubfoldersChecked(acct + "/", appIds)) {
-            prov->Shutdown();
-            return JsonError("Failed to list apps for account " + acct);
-        }
+        auto appIds = prov->ListSubfolders(acct + "/");
         for (const auto& appId : appIds) {
             if (appId.empty() || appId == "0") continue;
             if (!firstApp) out << ",";
@@ -1307,7 +1295,7 @@ static void PrintUsage() {
     fprintf(stderr, "  gc-blobs <provider> <account_id> <app_id> <cloud_root>  Delete unreferenced SHA blobs from cloud\n");
     fprintf(stderr, "  scan-all <provider>                                       List all apps across all accounts (single-pass)\n");
     fprintf(stderr, "  migrate <src_provider> <dst_provider>                     Copy all cloud data from one provider to another\n");
-    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3\n");
+    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3, folder, webdav\n");
 }
 
 int RunCli(int argc, char** argv) {
@@ -1459,9 +1447,6 @@ extern "C"
 __declspec(dllexport)
 #endif
 int CloudRedirect_CliMain(int argc, char** argv) {
-#ifndef _WIN32
-    Log::Init();
-#endif
     if (CloudRedirectCli::IsCliMode(argc, argv)) {
         return CloudRedirectCli::RunCli(argc, argv);
     }

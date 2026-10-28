@@ -1293,49 +1293,43 @@ GoogleDriveProvider::List(const std::string& prefix) {
     return result;
 }
 
-bool GoogleDriveProvider::ListSubfoldersChecked(const std::string& prefix,
-                                                std::vector<std::string>& outFolders) {
+std::vector<std::string>
+GoogleDriveProvider::ListSubfolders(const std::string& prefix) {
     // Used by CLI list-remote-app-ids to avoid full recursive enumeration.
-    outFolders.clear();
-
     uint32_t accountId, appId;
     std::string relPrefix;
     if (!ParsePath(prefix, accountId, appId, relPrefix)) {
-        LOG("[GDriveProvider] ListSubfolders '%s': unparseable prefix", prefix.c_str());
-        return false;
+        return {};
     }
 
     // Only account-wide listing makes sense for subfolder enumeration
     if (appId != kNoAppId) {
         // For app-level prefix, fall back to default implementation
-        return ICloudProvider::ListSubfoldersChecked(prefix, outFolders);
+        return ICloudProvider::ListSubfolders(prefix);
     }
 
-    // A missing root or account folder means no data has been uploaded yet,
-    // which is an empty result rather than a failure.
     std::string rootId;
     auto rootStatus = LookupRootFolder(&rootId);
-    if (rootStatus == LookupStatus::Missing) return true;
-    if (rootStatus != LookupStatus::Exists) return false;
+    if (rootStatus != LookupStatus::Exists) return {};
 
     std::string accountFolder;
     auto accountStatus = LookupAccountFolder(accountId, &accountFolder);
-    if (accountStatus == LookupStatus::Missing) return true;
-    if (accountStatus != LookupStatus::Exists) return false;
+    if (accountStatus != LookupStatus::Exists) return {};
 
     // List immediate children of account folder (folders only)
     bool ok = false;
     auto items = ListFolder(accountFolder, &ok);
-    if (!ok) return false;
+    if (!ok) return {};
 
+    std::vector<std::string> folders;
     for (auto& item : items) {
         if (item.isFolder) {
-            outFolders.push_back(item.name);
+            folders.push_back(item.name);
         }
     }
 
-    LOG("[GDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), outFolders.size());
-    return true;
+    LOG("[GDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), folders.size());
+    return folders;
 }
 
 bool GoogleDriveProvider::ListChecked(const std::string& prefix, std::vector<FileInfo>& result,
