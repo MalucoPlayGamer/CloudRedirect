@@ -96,6 +96,7 @@ set(PROVIDER_SOURCES
     src/providers/local_disk_provider.cpp
     src/providers/s3_provider.cpp
     src/providers/r2_provider.cpp
+    src/providers/webdav_provider.cpp
 )
 
 if(WIN32)
@@ -367,6 +368,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
         src/providers/local_disk_provider.cpp
         src/providers/s3_provider.cpp
         src/providers/r2_provider.cpp
+        src/providers/webdav_provider.cpp
     )
     target_include_directories(cloud_storage_staging_tests PRIVATE src/common src/providers src/testutil)
     if(WIN32)
