@@ -1,0 +1,88 @@
+name: Build and Release Windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag de versão para a Release (ex: v2.6.7)'
+        required: true
+        default: 'v2.6.7'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows (DLL + UI)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build C++ and .NET UI
+        run: cmake --build build --config Release --target ui --parallel
+
+      - name: Prepare Assets & Hashes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets
+          Copy-Item "build\Release\cloud_redirect.dll" -Destination "release-assets\"
+          Copy-Item "build\Release\cloud_redirect_cli.exe" -Destination "release-assets\"
+          Copy-Item "ui\bin\publish\CloudRedirect.exe" -Destination "release-assets\"
+
+          # Gerar os arquivos .sha256 (64 caracteres hexadecimais em minúsculo, sem quebras de linha ou BOM)
+          $dllHash = (Get-FileHash "release-assets\cloud_redirect.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("release-assets\cloud_redirect.dll.sha256", $dllHash)
+
+          $exeHash = (Get-FileHash "release-assets\CloudRedirect.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("release-assets\CloudRedirect.exe.sha256", $exeHash)
+
+      - name: Upload Artifacts (Download Direto nas Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudRedirect-Windows-Binaries
+          path: release-assets/
+
+      - name: Determine Release Tag
+        id: get_tag
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $tag = "${{ inputs.tag_name }}"
+          }
+          echo "TAG=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.TAG }}
+          name: CloudRedirect ${{ steps.get_tag.outputs.TAG }}
+          files: |
+            release-assets/cloud_redirect.dll
+            release-assets/cloud_redirect.dll.sha256
+            release-assets/CloudRedirect.exe
+            release-assets/CloudRedirect.exe.sha256
+            release-assets/cloud_redirect_cli.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
