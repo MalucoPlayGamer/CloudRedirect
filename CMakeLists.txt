@@ -248,7 +248,7 @@ endif()
 
 enable_testing()
 
-if(WIN32)
+if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/tests/dolintools_cloud_rules_tests.cpp")
     add_executable(dolintools_cloud_rules_tests tests/dolintools_cloud_rules_tests.cpp src/common/vdf.cpp)
     target_include_directories(dolintools_cloud_rules_tests PRIVATE src/common src/platform/win)
     add_test(NAME dolintools_cloud_rules_tests COMMAND dolintools_cloud_rules_tests)
@@ -514,7 +514,7 @@ if(WIN32)
 endif()
 
 # Offline optional check against a supplied Steam binary, never loaded as code.
-if(WIN32)
+if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/tests/dolintools_resolver_tests.cpp")
     add_executable(dolintools_resolver_tests EXCLUDE_FROM_ALL
         tests/dolintools_resolver_tests.cpp
         src/platform/win/sc_resolver.cpp src/platform/win/sig_scanner.cpp)
