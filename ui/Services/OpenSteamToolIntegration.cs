@@ -35,12 +35,35 @@ public static class OpenSteamToolIntegration
         @"^\s*enabled\s*=",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
+    public static string ResolveConfigPath(string steamPath)
+    {
+        var greenToolsPath = Path.Combine(steamPath, "greentools.toml");
+        if (File.Exists(greenToolsPath))
+            return greenToolsPath;
+
+        var greenToolsSubPath = Path.Combine(steamPath, "greentools", "greentools.toml");
+        if (File.Exists(greenToolsSubPath))
+            return greenToolsSubPath;
+
+        var openSteamToolPath = Path.Combine(steamPath, "opensteamtool.toml");
+        if (File.Exists(openSteamToolPath))
+            return openSteamToolPath;
+
+        if (File.Exists(Path.Combine(steamPath, "GreenTools.dll")) ||
+            Directory.Exists(Path.Combine(steamPath, "greentools")))
+        {
+            return greenToolsPath;
+        }
+
+        return openSteamToolPath;
+    }
+
     public static EnableResult EnsureCloudEnabled(string steamPath)
     {
         if (string.IsNullOrWhiteSpace(steamPath))
             throw new ArgumentException("Steam path is required.", nameof(steamPath));
 
-        var configPath = Path.Combine(steamPath, "opensteamtool.toml");
+        var configPath = ResolveConfigPath(steamPath);
         bool existed = File.Exists(configPath);
         string original = existed ? File.ReadAllText(configPath) : string.Empty;
         string newline = original.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
@@ -57,7 +80,7 @@ public static class OpenSteamToolIntegration
 
             if (cloudHeaderIndex >= 0)
                 throw new InvalidDataException(
-                    "opensteamtool.toml contains more than one [cloud] section.");
+                    $"{Path.GetFileName(configPath)} contains more than one [cloud] section.");
 
             cloudHeaderIndex = i;
 

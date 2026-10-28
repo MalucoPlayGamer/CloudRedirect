@@ -408,9 +408,12 @@ public partial class SetupPage : Page
         if (succeeded)
         {
             var detection = await Task.Run(() => ThirdPartyDetector.Detect(_steamPath!));
-            if (detection.DetectedTool == "OpenSteamTool")
+            if (detection.DetectedTool is "OpenSteamTool" or "GreenTools" or "greentools")
             {
-                Log("═══ Configure OpenSteamTool ═══");
+                var toolTitle = (detection.DetectedTool == "GreenTools" || detection.DetectedTool == "greentools")
+                    ? "GreenTools"
+                    : "OpenSteamTool";
+                Log($"═══ Configure {toolTitle} ═══");
                 try
                 {
                     var result = await Task.Run(() =>
@@ -419,7 +422,7 @@ public partial class SetupPage : Page
                     Log(result.Change switch
                     {
                         OpenSteamToolIntegration.ChangeKind.AlreadyEnabled =>
-                            "[cloud].enabled is already true.",
+                            $"[cloud].enabled is already true in {Path.GetFileName(result.ConfigPath)}.",
                         OpenSteamToolIntegration.ChangeKind.Created =>
                             $"Created {result.ConfigPath} with [cloud].enabled = true.",
                         _ =>
@@ -431,8 +434,9 @@ public partial class SetupPage : Page
                 }
                 catch (Exception ex)
                 {
-                    Log($"WARNING: OpenSteamTool config failed: {ex.Message}");
-                    Log("Enable [cloud].enabled = true manually in opensteamtool.toml before starting Steam.");
+                    Log($"WARNING: {toolTitle} config failed: {ex.Message}");
+                    var cfgName = Path.GetFileName(OpenSteamToolIntegration.ResolveConfigPath(_steamPath!));
+                    Log($"Enable [cloud].enabled = true manually in {cfgName} before starting Steam.");
                 }
                 Log("");
             }

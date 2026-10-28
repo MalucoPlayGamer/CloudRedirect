@@ -8,14 +8,22 @@ public static class ThirdPartyDetector
 {
     private static readonly string[] ProxyDllNames =
     {
-        "dwmapi.dll",      // OST + HubcapTools
-        "xinput1_4.dll",   // OST alternate
-        "dwrite.dll",      // HubcapTools
+        "dwmapi.dll",        // OST + HubcapTools
+        "xinput1_4.dll",     // OST alternate
+        "dwrite.dll",        // HubcapTools
+        "winmm.dll",         // OST alternate
+        "version.dll",       // OST alternate
+        "wsock32.dll",       // GreenTools / OST alternate
+        "crypt32.dll",       // OST alternate
+        "GreenTools.dll",    // GreenTools core
+        "OpenSteamTool.dll", // OST core
     };
 
     // Compatible clients (allow deployment).
     private static readonly string[] CompatibleMarkers =
     {
+        "GreenTools",     // GreenTools
+        "greentools",     // GreenTools (lowercase variant)
         "OpenSteamTool",  // OST
         "HubcapTools",    // HubcapTools
         "hubcaptools",    // HubcapTools (lowercase variant)
@@ -107,7 +115,8 @@ public static class ThirdPartyDetector
     {
         foreach (var marker in markers)
         {
-            if (IndexOf(fileBytes, Encoding.ASCII.GetBytes(marker)) >= 0)
+            if (IndexOf(fileBytes, Encoding.ASCII.GetBytes(marker)) >= 0 ||
+                IndexOf(fileBytes, Encoding.Unicode.GetBytes(marker)) >= 0)
                 return true;
         }
         return false;
@@ -117,7 +126,8 @@ public static class ThirdPartyDetector
     {
         foreach (var marker in markers)
         {
-            if (IndexOf(fileBytes, Encoding.ASCII.GetBytes(marker)) >= 0)
+            if (IndexOf(fileBytes, Encoding.ASCII.GetBytes(marker)) >= 0 ||
+                IndexOf(fileBytes, Encoding.Unicode.GetBytes(marker)) >= 0)
                 return marker;
         }
         return null;
