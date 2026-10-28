@@ -96,13 +96,13 @@ set(PROVIDER_SOURCES
     src/providers/local_disk_provider.cpp
     src/providers/s3_provider.cpp
     src/providers/r2_provider.cpp
-    src/providers/webdav_provider.cpp
 )
 
 if(WIN32)
     set(PLATFORM_SOURCES
         src/platform/win/dllmain.cpp
         src/platform/win/cr_api.cpp
+        src/platform/win/dolintools_cloud760.cpp
         src/platform/win/cloud_intercept.cpp
         src/platform/win/sig_scanner.cpp
         src/platform/win/sc_resolver.cpp
@@ -248,6 +248,12 @@ endif()
 
 enable_testing()
 
+if(WIN32)
+    add_executable(dolintools_cloud_rules_tests tests/dolintools_cloud_rules_tests.cpp src/common/vdf.cpp)
+    target_include_directories(dolintools_cloud_rules_tests PRIVATE src/common src/platform/win)
+    add_test(NAME dolintools_cloud_rules_tests COMMAND dolintools_cloud_rules_tests)
+endif()
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     add_compile_definitions(CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
     if(WIN32)
@@ -368,7 +374,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
         src/providers/local_disk_provider.cpp
         src/providers/s3_provider.cpp
         src/providers/r2_provider.cpp
-        src/providers/webdav_provider.cpp
     )
     target_include_directories(cloud_storage_staging_tests PRIVATE src/common src/providers src/testutil)
     if(WIN32)
@@ -506,4 +511,12 @@ if(WIN32)
         COMMENT "Publishing CloudRedirect UI"
         DEPENDS cloud_redirect cloud_redirect_cli
     )
+endif()
+
+# Offline optional check against a supplied Steam binary, never loaded as code.
+if(WIN32)
+    add_executable(dolintools_resolver_tests EXCLUDE_FROM_ALL
+        tests/dolintools_resolver_tests.cpp
+        src/platform/win/sc_resolver.cpp src/platform/win/sig_scanner.cpp)
+    target_include_directories(dolintools_resolver_tests PRIVATE src/common src/platform/win)
 endif()

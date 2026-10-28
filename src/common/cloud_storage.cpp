@@ -6,7 +6,6 @@
 #include "onedrive_provider.h"
 #include "s3_provider.h"
 #include "r2_provider.h"
-#include "webdav_provider.h"
 #include "cloud_metadata_paths.h"
 #include "cloud_staging.h"
 #include "file_util.h"
@@ -59,6 +58,13 @@ static std::mutex                        g_mutex;
 // Cache confirmed-missing metadata paths to avoid repeated API round trips.
 static std::mutex                        g_missingMetadataMutex;
 static std::unordered_set<std::string>   g_missingMetadataPaths;
+static LegacyStatsInventory::Cache g_legacyStatsInventory;
+
+bool ListLegacyStatsMetadata(uint32_t accountId, LegacyStatsInventory::Inventory& out) {
+    InflightSyncScope guard;
+    if (!guard.entered || !g_provider || !g_provider->IsAuthenticated()) return false;
+    return g_legacyStatsInventory.Read(*g_provider, accountId, out);
+}
 
 // Per-app blob path index: maps filename -> resolved cloud path (avoids fallback chain).
 static std::mutex                        g_blobIndexMutex;
@@ -898,6 +904,7 @@ static void PruneStaleConflictCopies(const std::string& localRoot) {
 }
 
 void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider) {
+    g_legacyStatsInventory.Clear();
     std::lock_guard<std::mutex> lock(g_mutex);
     g_localRoot = localRoot;
 #ifdef _WIN32
@@ -3156,10 +3163,6 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
     if (lower == "s3") {
         return std::make_unique<S3Provider>();
     }
-    // WebDAV 用配置文件里的 URL + 账号密码直连，不涉及 OAuth 刷新回调。
-    if (lower == "webdav" || lower == "dav") {
-        return std::make_unique<WebDavProvider>();
-    }
     // Wire the auth-failure callback at construction so CloudProviderBase
     // doesn't reverse-depend on CloudStorage.
     auto wireAuthCallback = [](std::unique_ptr<CloudProviderBase> p)
@@ -3213,8 +3216,6 @@ std::string ResolveProviderTokenPath(const std::string& configDir,
     //    explicit token_paths entry. Windows and Linux use different names.
     if (p == "r2")       return configDir + "r2_credentials.json";
     if (p == "s3")       return configDir + "s3_credentials.json";
-    if (p == "webdav" || p == "dav")
-        return configDir + "webdav_credentials.json";
 #ifdef _WIN32
     if (p == "gdrive")   return configDir + "google_tokens.json";
     if (p == "onedrive") return configDir + "onedrive_tokens.json";

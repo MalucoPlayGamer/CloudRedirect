@@ -15,6 +15,8 @@
 #include "pending_ops_journal.h"
 #include "file_util.h"
 #include "remotecache_repair.h"
+#include "cloud_serving_rules.h"
+#include "cloud_inventory_ack.h"
 #include "steam_kv_injector.h"
 #include "vdf.h"
 #include "log.h"
@@ -141,6 +143,23 @@ static std::mutex g_fullManifestSentMutex;
 // Per-(account, app) cached CN and buildId for the fast repeat-call path.
 static std::unordered_map<uint64_t, uint64_t> g_cachedCloudCN;
 static std::unordered_map<uint64_t, uint64_t> g_cachedAppBuildIdHwm;
+static std::unordered_map<uint64_t, std::vector<CloudInventoryAck::File>> g_servedInventories;
+
+static bool NativeInventoryAcknowledged(uint32_t accountId, uint32_t appId,
+                                        uint64_t clientCN, uint64_t servedCN,
+                                        const std::vector<CloudInventoryAck::File>& files) {
+    try {
+        const auto path = FileUtil::Utf8ToPath(GetSteamPath()) / "userdata"
+            / std::to_string(accountId) / std::to_string(appId) / "remotecache.vdf";
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size > 16 * 1024 * 1024) return false;
+        std::ifstream input(path, std::ios::binary);
+        std::string cache(static_cast<size_t>(size), '\0');
+        if (!input.read(cache.data(), static_cast<std::streamsize>(cache.size()))) return false;
+        return CloudInventoryAck::CanReuse(cache, appId, clientCN, servedCN, files);
+    } catch (...) { return false; }
+}
 
 static uint64_t GetCachedCloudCN(uint32_t accountId, uint32_t appId) {
     auto it = g_cachedCloudCN.find(MakeAppAccountKey(accountId, appId));
@@ -580,13 +599,25 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         bool repeatCall = false;
         uint64_t cachedCN = 0;
         uint64_t cachedBuildId = 0;
+        std::vector<CloudInventoryAck::File> servedFiles;
         {
             std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
-            if (g_fullManifestSentApps.count(cacheKey) > 0) {
+            if (g_fullManifestSentApps.count(cacheKey) > 0 && g_servedInventories.count(cacheKey) > 0) {
                 repeatCall = true;
                 cachedCN = GetCachedCloudCN(accountId, appId);
                 cachedBuildId = GetCachedAppBuildIdHwm(accountId, appId);
+                servedFiles = g_servedInventories.at(cacheKey);
             }
+        }
+        if (repeatCall && !NativeInventoryAcknowledged(accountId, appId, clientChangeNumber, cachedCN, servedFiles)) {
+            LOG("[NS-CL] GetAppFileChangelist app=%u: native inventory not acknowledged (clientCN=%llu servedCN=%llu), retrying inventory",
+                appId, clientChangeNumber, cachedCN);
+            std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
+            g_fullManifestSentApps.erase(cacheKey);
+            g_cachedCloudCN.erase(cacheKey);
+            g_cachedAppBuildIdHwm.erase(cacheKey);
+            g_servedInventories.erase(cacheKey);
+            repeatCall = false;
         }
         if (repeatCall) {
             // CN probe; on change, invalidate cache and fall through to full fetch.
@@ -601,6 +632,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 g_fullManifestSentApps.erase(cacheKey);
                 g_cachedCloudCN.erase(cacheKey);
                 g_cachedAppBuildIdHwm.erase(cacheKey);
+                g_servedInventories.erase(cacheKey);
                 // Fall through to full fetch below
             } else if (remoteCN != cachedCN) {
                 LOG("[NS-CL] GetAppFileChangelist app=%u: remote CN=%llu differs from cached CN=%llu, invalidating cache",
@@ -609,6 +641,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 g_fullManifestSentApps.erase(cacheKey);
                 g_cachedCloudCN.erase(cacheKey);
                 g_cachedAppBuildIdHwm.erase(cacheKey);
+                g_servedInventories.erase(cacheKey);
                 // Fall through to full fetch below
             } else {
                 LOG("[NS-CL] GetAppFileChangelist app=%u: repeat call, CN unchanged (%llu), returning cached empty delta",
@@ -715,6 +748,10 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     uint64_t serverChangeNumber = 0;  // Initialize to prevent UB in edge cases
     bool responseIsDelta = true;
 
+    const uint64_t guardLocalCN = LocalStorage::GetChangeNumber(accountId, appId);
+    const bool interruptedUpload =
+        PendingOpsJournal::HasInterruptedUpload(accountId, appId);
+
     if (inconclusiveFetch) {
         // Cloud state unknown: serve local files as a pure delta (is_only_delta=1)
         // so Steam never reconcile-deletes or treats it as cloud-empty. Don't rewind CN.
@@ -741,6 +778,15 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         LOG("[NS-CL] GetAppFileChangelist app=%u: cloud manifest is empty at CN=%llu, "
             "returning empty authoritative (native advances local CN to match)",
             appId, cloudCN);
+    } else if (haveCloudManifest && !cloudManifest.empty() && interruptedUpload &&
+               cloudCN <= guardLocalCN && clientChangeNumber >= cloudCN) {
+        SetRpcCrashContext("GetChangelist:interrupted-upload", "Cloud.GetAppFileChangelist#1", appId);
+        serverChangeNumber = clientChangeNumber > cloudCN ? clientChangeNumber : cloudCN;
+        responseIsDelta = true;
+        LOG("[NS-CL] GetAppFileChangelist app=%u: interrupted upload (cloudCN=%llu <= "
+            "localCN=%llu, %zu cloud files); returning empty delta at CN=%llu to protect "
+            "unpublished local content",
+            appId, cloudCN, guardLocalCN, cloudManifest.size(), serverChangeNumber);
     } else if (haveCloudManifest && !cloudManifest.empty()) {
         SetRpcCrashContext("GetChangelist:manifest-delta", "Cloud.GetAppFileChangelist#1", appId);
         // Steam-faithful delta: compute diff between clientCN snapshot and current manifest.
@@ -805,12 +851,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                     files.push_back(std::move(fe));
                 }
 
-                {
-                    std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
-                    g_fullManifestSentApps.insert(cacheKey);
-                    g_cachedCloudCN[cacheKey] = cloudCN;
-                    g_cachedAppBuildIdHwm[cacheKey] = appBuildIdHwm;
-                }
                 LOG("[NS-CL] GetAppFileChangelist app=%u: returning full manifest (%zu files) at CN=%llu (clientCN=%llu)",
                     appId, files.size(), cloudCN, clientChangeNumber);
             }
@@ -832,18 +872,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
     LOG("[NS-CL] GetAppFileChangelist app=%u clientCN=%llu serverCN=%llu files=%zu",
         appId, clientChangeNumber, serverChangeNumber, files.size());
-
-    // Cache result so repeat calls (CM reconnects) skip cloud I/O entirely.
-    // Don't cache placeholder responses (CN==0, empty files).
-    if (serverChangeNumber > 0 || !files.empty()) {
-        const uint64_t cacheKey = MakeAppAccountKey(accountId, appId);
-        std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
-        if (g_fullManifestSentApps.count(cacheKey) == 0) {
-            g_fullManifestSentApps.insert(cacheKey);
-            g_cachedCloudCN[cacheKey] = serverChangeNumber;
-            g_cachedAppBuildIdHwm[cacheKey] = appBuildIdHwm;
-        }
-    }
 
     // build path_prefix table and file entries
     std::unordered_map<std::string, uint32_t> prefixMap;
@@ -957,12 +985,6 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
     // Multi-root serving: emit one wire entry per matching rule root (mirrors native).
     // One blob stored, but listed under each root for lossless over-quota eviction.
-    struct RuleRoot {
-        std::string token;      // %WinAppDataLocal%
-        std::string cloudPath;  // rule path, normalized, no leading/trailing slash
-        std::string pattern;    // * etc.
-        bool recursive = false;
-    };
     std::string steamPath = CloudIntercept::GetSteamPath();
 
     auto resolvableTokens = steamPath.empty()
@@ -989,61 +1011,11 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         }
     }
 
-    std::vector<RuleRoot> ruleRoots;
-    {
-        if (!steamPath.empty()) {
-            auto rules = AutoCloudScan::GetRules(steamPath, appId, accountId);
-            for (const auto& r : rules) {
-                // Use RAW rule root (cloudRoot), not override-resolved root. Native
-                // keys cloud storage by raw root; collapsing loses cross-root dupes.
-                const std::string& rawRoot =
-                    !r.cloudRoot.empty() ? r.cloudRoot : r.root;
-                if (rawRoot.empty()) continue;
-                RuleRoot rr;
-                rr.token = "%" + rawRoot + "%";
-                std::string p = r.path;  // cloud path uses the rule's (untransformed) path
-                for (auto& c : p) if (c == '\\') c = '/';
-                while (!p.empty() && p.front() == '/') p.erase(0, 1);
-                while (!p.empty() && p.back() == '/') p.pop_back();
-                rr.cloudPath = p;
-                rr.pattern = r.pattern.empty() ? "*" : r.pattern;
-                rr.recursive = r.recursive;
-                ruleRoots.push_back(std::move(rr));
-            }
-        }
-    }
-
-    // Return the set of root tokens a file's cloud path belongs to, native-faithful.
-    // Falls back to the file's recorded token (or default) when rules are
-    // unavailable, preserving prior single-root behavior for non-collision apps.
-    auto rootsForFile = [&](const std::string& filename) -> std::vector<std::string> {
-        std::vector<std::string> out;
-        for (const auto& rr : ruleRoots) {
-            // file must live under the rule's cloud path prefix
-            std::string rel;
-            if (rr.cloudPath.empty()) {
-                rel = filename;
-            } else {
-                std::string pfx = rr.cloudPath + "/";
-                if (filename.size() <= pfx.size() ||
-                    AutoCloudUtil::ToLowerAscii(filename.substr(0, pfx.size())) !=
-                        AutoCloudUtil::ToLowerAscii(pfx))
-                    continue;
-                rel = filename.substr(pfx.size());
-            }
-            // non-recursive rules only match files directly in the dir
-            if (!rr.recursive && rel.find('/') != std::string::npos) continue;
-            // match pattern against the leaf (patterns here are leaf globs like *.sav)
-            std::string leafName = rel;
-            size_t s = leafName.rfind('/');
-            if (s != std::string::npos) leafName = leafName.substr(s + 1);
-            const std::string& matchTarget =
-                rr.pattern.find('/') == std::string::npos ? leafName : rel;
-            if (!AutoCloudUtil::WildcardMatchInsensitive(rr.pattern, matchTarget)) continue;
-            if (std::find(out.begin(), out.end(), rr.token) == out.end())
-                out.push_back(rr.token);
-        }
-        return out;
+    const auto ruleRoots = steamPath.empty()
+        ? std::vector<CloudServingRules::Rule>{}
+        : CloudServingRules::ForCurrentPlatform(AutoCloudScan::GetRules(steamPath, appId, accountId));
+    auto rootsForFile = [&](const std::string& filename) {
+        return CloudServingRules::RootsForFile(ruleRoots, filename);
     };
 
     SetRpcCrashContext("GetChangelist:prepare-files", "Cloud.GetAppFileChangelist#1", appId);
@@ -1120,6 +1092,17 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
     // Don't pre-seed remotecache.vdf; let Steam manage it via GetChangelist diffs.
     // Pre-seeding caused conflicts (Steam interpreted it as "local changed").
+
+    if (!responseIsDelta && CloudServingRules::ShouldCacheChangelist(serverChangeNumber, false, files.size())) {
+        std::vector<CloudInventoryAck::File> inventory;
+        for (const auto& file : files)
+            if (!file.deleted) inventory.push_back({file.filename, file.timestamp});
+        std::lock_guard<std::mutex> lock(g_fullManifestSentMutex);
+        g_fullManifestSentApps.insert(appKey);
+        g_cachedCloudCN[appKey] = serverChangeNumber;
+        g_cachedAppBuildIdHwm[appKey] = appBuildIdHwm;
+        g_servedInventories[appKey] = std::move(inventory);
+    }
 
     SetRpcCrashContext("GetChangelist:write-response", "Cloud.GetAppFileChangelist#1", appId);
     PB::Writer body;
@@ -1306,11 +1289,10 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
         }
     }
 
+    // Don't clear UploadPending here: this runs before GetAppFileChangelist reads the
+    // marker. RecordLaunchIntent re-persists it and honours ignorePendingOperations.
     auto pending = PendingOpsJournal::RecordLaunchIntent(
         accountId, appId, currentSession, ignorePendingOperations);
-
-    // Launch intent clears pending-upload state.
-    PendingOpsJournal::ClearUploadPending(accountId, appId);
 
     for (const auto& entry : pending) {
         PB::Writer op;
@@ -2169,9 +2151,12 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
         }
 
         if (!publishSucceeded) {
-            PendingOpsJournal::RecordUploadBatchEnd(accountId, appId);
-            LOG("[NS] CompleteBatch(pub): all publish attempts exhausted for app %u",
-                appId);
+            // Nothing reached the cloud: downgrade to UploadPending, not clear.
+            // RecordUploadBatchEnd here would drop the marker and let stale cloud
+            // state overwrite unpublished saves.
+            PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
+            LOG("[NS] CompleteBatch(pub): all publish attempts exhausted for app %u "
+                "-- upload left pending", appId);
         }
         // Resolve the barrier BEFORE GC — session release must not wait on housekeeping.
         publishPromise.set_value();

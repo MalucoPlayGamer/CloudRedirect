@@ -2,6 +2,7 @@
 #include "http_util.h"
 #include "json.h"
 #include "log.h"
+#include "legacy_stats_inventory.h"
 
 #include <thread>
 #include <chrono>
@@ -1286,6 +1287,76 @@ ICloudProvider::ExistsStatus GoogleDriveProvider::CheckExists(const std::string&
     return ExistsStatus::Error;
 }
 
+bool GoogleDriveProvider::ListLegacyMetadata(uint32_t accountId, std::vector<FileInfo>& outFiles) {
+    outFiles.clear();
+    std::string accountFolder;
+    const auto status = LookupAccountFolder(accountId, &accountFolder);
+    if (status == LookupStatus::Missing) return true;
+    if (status != LookupStatus::Exists) return false;
+    bool ok = false;
+    const auto children = ListFolder(accountFolder, &ok);
+    if (!ok) return false;
+    std::vector<std::pair<std::string,uint32_t>> folders;
+    for (const auto& child : children) {
+        uint32_t id = 0;
+        if (child.isFolder && LegacyStatsInventory::ParseId(child.name,id) && id)
+            folders.emplace_back(child.id,id);
+    }
+
+    // Query only stats.json directly under real app folders, in bounded groups.
+    // No recursive traversal of save/CAS trees and no downloads for missing IDs.
+    size_t queries = 0;
+    for (size_t begin = 0; begin < folders.size(); begin += 40) {
+        std::string parents;
+        std::unordered_map<std::string,uint32_t> apps;
+        const auto end = (std::min)(begin + 40,folders.size());
+        for (size_t i = begin; i < end; ++i) {
+            if (!parents.empty()) parents += " or ";
+            parents += "'" + EscapeQuery(folders[i].first) + "' in parents";
+            apps[folders[i].first] = folders[i].second;
+        }
+        const auto query = "trashed=false and mimeType!='application/vnd.google-apps.folder' and name='stats.json' and (" + parents + ")";
+        const auto base = "/drive/v3/files?q=" + UrlEncode(query)
+            + "&fields=nextPageToken,files(name,parents)&pageSize=1000";
+        std::string page;
+        do {
+            auto url = base;
+            if (!page.empty()) url += "&pageToken=" + UrlEncode(page);
+            const auto response = ApiGet(url); ++queries;
+            if (response.status != 200) return false;
+            const auto json = Json::Parse(response.body);
+            if (json.type != Json::Type::Object || json["files"].type != Json::Type::Array) return false;
+            for (const auto& file : json["files"].arrVal) {
+                if (file["name"].str() != "stats.json") continue;
+                for (const auto& parent : file["parents"].arrVal) {
+                    const auto app = apps.find(parent.str());
+                    if (app != apps.end()) outFiles.push_back({std::to_string(accountId) + "/" + std::to_string(app->second) + "/stats.json"});
+                }
+            }
+            page = json["nextPageToken"].str();
+        } while (!page.empty());
+    }
+
+    // First-generation time records live in one known directory, not one
+    // guessed path per AppID. A missing directory is an authoritative empty set.
+    std::string appZero, playtime;
+    const auto zeroStatus = LookupAppFolder(accountId,0,&appZero);
+    if (zeroStatus == LookupStatus::Error) return false;
+    if (zeroStatus == LookupStatus::Exists) {
+        const auto timeStatus = ResolveSubfolders(appZero,"blobs/Playtime",&playtime,false);
+        if (timeStatus == LookupStatus::Error) return false;
+        if (timeStatus == LookupStatus::Exists) {
+            const auto times = ListFolder(playtime,&ok);
+            if (!ok) return false;
+            for (const auto& file : times)
+                if (!file.isFolder) outFiles.push_back({std::to_string(accountId) + "/0/blobs/Playtime/" + file.name});
+        }
+    }
+    LOG("[GDriveProvider] Legacy metadata inventory: %zu real app folders, %zu grouped stats query page(s), %zu candidate file(s); save trees not scanned",
+        folders.size(),queries,outFiles.size());
+    return true;
+}
+
 std::vector<ICloudProvider::FileInfo>
 GoogleDriveProvider::List(const std::string& prefix) {
     std::vector<FileInfo> result;
@@ -1293,43 +1364,49 @@ GoogleDriveProvider::List(const std::string& prefix) {
     return result;
 }
 
-std::vector<std::string>
-GoogleDriveProvider::ListSubfolders(const std::string& prefix) {
+bool GoogleDriveProvider::ListSubfoldersChecked(const std::string& prefix,
+                                                std::vector<std::string>& outFolders) {
     // Used by CLI list-remote-app-ids to avoid full recursive enumeration.
+    outFolders.clear();
+
     uint32_t accountId, appId;
     std::string relPrefix;
     if (!ParsePath(prefix, accountId, appId, relPrefix)) {
-        return {};
+        LOG("[GDriveProvider] ListSubfolders '%s': unparseable prefix", prefix.c_str());
+        return false;
     }
 
     // Only account-wide listing makes sense for subfolder enumeration
     if (appId != kNoAppId) {
         // For app-level prefix, fall back to default implementation
-        return ICloudProvider::ListSubfolders(prefix);
+        return ICloudProvider::ListSubfoldersChecked(prefix, outFolders);
     }
 
+    // A missing root or account folder means no data has been uploaded yet,
+    // which is an empty result rather than a failure.
     std::string rootId;
     auto rootStatus = LookupRootFolder(&rootId);
-    if (rootStatus != LookupStatus::Exists) return {};
+    if (rootStatus == LookupStatus::Missing) return true;
+    if (rootStatus != LookupStatus::Exists) return false;
 
     std::string accountFolder;
     auto accountStatus = LookupAccountFolder(accountId, &accountFolder);
-    if (accountStatus != LookupStatus::Exists) return {};
+    if (accountStatus == LookupStatus::Missing) return true;
+    if (accountStatus != LookupStatus::Exists) return false;
 
     // List immediate children of account folder (folders only)
     bool ok = false;
     auto items = ListFolder(accountFolder, &ok);
-    if (!ok) return {};
+    if (!ok) return false;
 
-    std::vector<std::string> folders;
     for (auto& item : items) {
         if (item.isFolder) {
-            folders.push_back(item.name);
+            outFolders.push_back(item.name);
         }
     }
 
-    LOG("[GDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), folders.size());
-    return folders;
+    LOG("[GDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), outFolders.size());
+    return true;
 }
 
 bool GoogleDriveProvider::ListChecked(const std::string& prefix, std::vector<FileInfo>& result,

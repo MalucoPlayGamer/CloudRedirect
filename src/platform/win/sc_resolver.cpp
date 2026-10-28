@@ -680,11 +680,10 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.getAppInfo = ResolveGetAppInfo();
     uint32_t appInfoCacheOff = DetectAppInfoCacheOffset(r.getAppInfo);
     if (!appInfoCacheOff) {
-        appInfoCacheOff = 0xE68;
-        LOG("[Resolver] AppInfoCache offset: falling back to legacy 0xE68");
+        LOG("[Resolver] AppInfoCache offset unresolved; KV injection disabled (no guessed fallback)");
     }
     r.engineOffAppInfoCache = appInfoCacheOff;
-    r.globalEngine = ResolveGlobalEngine(steamClientBase, appInfoCacheOff);
+    r.globalEngine = appInfoCacheOff ? ResolveGlobalEngine(steamClientBase, appInfoCacheOff) : 0;
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -1130,7 +1129,7 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
 }
 
 void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
-    LOG("[Resolver] === Comparison (resolved RVA vs expected) ===");
+    LOG("[Resolver] === Resolution diagnostics (historical RVAs are informational) ===");
 
     int total = 0, matched = 0, failed = 0;
     auto logEntry = [&](const char* name, uintptr_t resolved, uintptr_t expectedRva) {
@@ -1140,7 +1139,7 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
             bool match = (resolvedRva == expectedRva);
             if (match) matched++;
             LOG("[Resolver]   %-30s 0x%llX  %s",
-                name, (uint64_t)resolvedRva, match ? "OK" : "MISMATCH");
+                name, (uint64_t)resolvedRva, match ? "RESOLVED (historical address)" : "RESOLVED (address changed)");
         } else {
             failed++;
             LOG("[Resolver]   %-30s FAILED (expected 0x%llX)", name, (uint64_t)expectedRva);
@@ -1184,7 +1183,7 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     logEntry("RespDescriptor",         r.respDescriptor,          0x16D5590);
     logEntry("RegKeySyncTime",         r.regKeySyncTime,          0x16E8248);
 
-    LOG("[Resolver] Result: %d/%d matched, %d failed", matched, total, failed);
+    LOG("[Resolver] Result: %d historical matches / %d addresses, %d unresolved", matched, total, failed);
 }
 
 } // namespace ScResolver

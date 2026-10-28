@@ -5,6 +5,7 @@
 #include "local_metadata_store.h"
 #include "manifest_store.h"
 #include "token_store.h"
+#include "legacy_stats_inventory.h"
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,7 @@ struct CloudAppState; // defined in app_state.h
 void Init(const std::string& localRoot, std::unique_ptr<ICloudProvider> provider);
 void Shutdown();
 bool IsCloudActive();
+bool ListLegacyStatsMetadata(uint32_t accountId, LegacyStatsInventory::Inventory& out);
 
 bool StoreBlob(uint32_t accountId, uint32_t appId,
                const std::string& filename,

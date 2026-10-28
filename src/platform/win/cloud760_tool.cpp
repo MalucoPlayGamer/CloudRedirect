@@ -76,6 +76,21 @@ static bool resolve(HMODULE m, const char* name, T& out) {
 
 // Load bundled steam_api.dll from exe directory (no game-folder search).
 static HMODULE LoadSteamApiDll() {
+    HMODULE ownModule = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&LoadSteamApiDll), &ownModule);
+    wchar_t ownPath[32768] = {};
+    DWORD ownLength = GetModuleFileNameW(ownModule, ownPath, 32768);
+    if (ownLength > 0 && ownLength < 32768) {
+        wchar_t* slash = wcsrchr(ownPath, L'\\');
+        if (slash) {
+            *(slash + 1) = 0;
+            std::wstring sdkPath = std::wstring(ownPath) + L"steam_api.dll";
+            return LoadLibraryExW(sdkPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
+    }
+    return nullptr;
+#if 0
     // Pin the search to our own directory so we always load the bundled copy and
     // never a stray steam_api.dll from PATH / the working directory.
     char exeDir[MAX_PATH] = {};
@@ -91,6 +106,7 @@ static HMODULE LoadSteamApiDll() {
     }
     // Fallback: default search order (cwd / PATH).
     return LoadLibraryA("steam_api.dll");
+#endif
 }
 
 static bool LoadSteamApi(SteamApi& api) {

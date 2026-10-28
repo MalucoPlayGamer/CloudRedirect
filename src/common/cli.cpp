@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -25,10 +26,12 @@
 #include <atomic>
 #include <algorithm>
 #include <unordered_set>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <Windows.h>
 #include <Shlobj.h>
+#include "../platform/win/dolintools_compat.h"
 #else
 #include <unistd.h>
 #include <pwd.h>
@@ -39,11 +42,14 @@ namespace CloudRedirectCli {
 
 static std::string GetConfigDir() {
 #ifdef _WIN32
+    if (const wchar_t* isolated = _wgetenv(L"DOLINTOOLS_CLOUD_CONFIG_DIR"); isolated && *isolated)
+        return FileUtil::WideToUtf8(isolated) + "\\";
     wchar_t* appDataPath = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appDataPath))) {
         int len = WideCharToMultiByte(CP_UTF8, 0, appDataPath, -1, nullptr, 0, nullptr, nullptr);
-        std::string result(len - 1, '\0');
+        std::string result(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, appDataPath, -1, result.data(), len, nullptr, nullptr);
+        result.resize(len - 1);
         CoTaskMemFree(appDataPath);
         return result + "\\CloudRedirect\\";
     }
@@ -59,7 +65,12 @@ static std::string GetTokenPath(const std::string& provider) {
 
     std::string configJson;
     std::string configPath = configDir + "config.json";
-    FILE* f = fopen(configPath.c_str(), "rb");
+    FILE* f = nullptr;
+#ifdef _WIN32
+    f = _wfopen(FileUtil::Utf8ToPath(configPath).c_str(), L"rb");
+#else
+    f = fopen(configPath.c_str(), "rb");
+#endif
     if (f) {
         fseek(f, 0, SEEK_END);
         long len = ftell(f);
@@ -72,6 +83,10 @@ static std::string GetTokenPath(const std::string& provider) {
         fclose(f);
     }
 
+    if (provider == "folder" || provider == "local") {
+        auto cfg = Json::Parse(configJson);
+        return cfg["sync_path"].type == Json::Type::String ? cfg["sync_path"].str() : std::string();
+    }
     return ResolveProviderTokenPath(configDir, configJson, provider);
 }
 
@@ -139,6 +154,8 @@ static std::string JsonSuccess() {
     return JsonObject({{"success", JsonBool(true)}});
 }
 
+#include "dolintools_snapshot.h"
+
 std::string CmdAuthStatus(const std::string& provider) {
     std::string tokenPath = GetTokenPath(provider);
     if (tokenPath.empty()) {
@@ -188,13 +205,18 @@ std::string CmdListRemoteApps(const std::string& provider, const std::string& ac
 
     // List app folders first, then per-app stats (avoids heavy recursive listing).
     std::string prefix = accountId + "/";
-    auto appIds = prov->ListSubfolders(prefix);
+    std::vector<std::string> appIds;
+    if (!prov->ListSubfoldersChecked(prefix, appIds)) {
+        prov->Shutdown();
+        return JsonError("Failed to list apps for account " + accountId);
+    }
     std::map<std::string, std::pair<int, uint64_t>> appStats; // appId -> (count, totalSize)
     for (const auto& appId : appIds) {
         if (appId.empty()) continue;
 
         std::vector<ICloudProvider::FileInfo> files;
-        if (!prov->ListChecked(prefix + appId + "/", files)) {
+        bool complete = false;
+        if (!prov->ListChecked(prefix + appId + "/", files, &complete) || !complete) {
             prov->Shutdown();
             return JsonError("Failed to list remote app " + appId);
         }
@@ -249,7 +271,11 @@ std::string CmdListRemoteAppIds(const std::string& provider, const std::string& 
     }
     
     std::string prefix = accountId + "/";
-    auto folders = prov->ListSubfolders(prefix);
+    std::vector<std::string> folders;
+    if (!prov->ListSubfoldersChecked(prefix, folders)) {
+        prov->Shutdown();
+        return JsonError("Failed to list apps for account " + accountId);
+    }
     prov->Shutdown();
     
     // Build JSON array of app IDs
@@ -346,7 +372,12 @@ std::string CmdDeleteRemoteApp(const std::string& provider, const std::string& a
     
     // List all files under accountId/appId/ and delete them
     std::string prefix = accountId + "/" + appId + "/";
-    auto files = prov->List(prefix);
+    std::vector<ICloudProvider::FileInfo> files;
+    bool complete = false;
+    if (!prov->ListChecked(prefix, files, &complete) || !complete) {
+        prov->Shutdown();
+        return JsonError("Incomplete listing; cloud files were not deleted.");
+    }
     
     int deleted = 0;
     int failed = 0;
@@ -543,13 +574,14 @@ std::string CmdDownloadBlob(const std::string& provider, const std::string& acco
     std::string path = accountId + "/" + appId + "/" + blobName;
     std::vector<uint8_t> data;
     bool ok = prov->Download(path, data);
+    bool missing = !ok && prov->CheckExists(path) == ICloudProvider::ExistsStatus::Missing;
     prov->Shutdown();
 
     if (!ok) {
         return JsonObject({
-            {"success", JsonBool(false)},
+            {"success", JsonBool(missing)},
             {"found", JsonBool(false)},
-            {"error", JsonString("Blob not found")}
+            {"error", JsonString(missing ? "" : "Cloud file could not be read")}
         });
     }
 
@@ -590,9 +622,7 @@ std::string CmdDeleteBlobs(const std::string& provider, const std::string& accou
     bool firstFailed = true;
     
     for (const auto& name : blobNames) {
-        if (name.find('/') != std::string::npos || 
-            name.find('\\') != std::string::npos ||
-            name == ".." || name == ".") {
+        if (!DolinSafeRelative(name)) {
             failed++;
             if (!firstFailed) failedNames << ",";
             failedNames << JsonString(name);
@@ -603,8 +633,12 @@ std::string CmdDeleteBlobs(const std::string& provider, const std::string& accou
         std::string path = blobDir + name;
         if (prov->Remove(path)) {
             deleted++;
+        } else if (prov->CheckExists(path) == ICloudProvider::ExistsStatus::Missing) {
+            deleted++; // Only definite absence is idempotent success, never an auth/network error.
         } else {
-            deleted++; // idempotent: treat absent as success
+            failed++;
+            if (!firstFailed) failedNames << ",";
+            failedNames << JsonString(name); firstFailed = false;
         }
     }
     failedNames << "]";
@@ -669,11 +703,24 @@ std::string CmdSyncRemoteApp(const std::string& provider, const std::string& acc
     auto localFiles = LocalStorage::GetFileList(parsedAccountId, parsedAppId);
     auto rootTokens = LocalMetadataStore::LoadRootTokens(parsedAccountId, parsedAppId);
     auto fileTokens = LocalMetadataStore::LoadFileTokens(parsedAccountId, parsedAppId);
+    auto inventory = CloudStorage::FetchCloudState(parsedAccountId, parsedAppId);
+    bool verified = inventory.status == CloudStorage::StateFetchStatus::Ok || inventory.status == CloudStorage::StateFetchStatus::NotFound;
+    if (inventory.status == CloudStorage::StateFetchStatus::Ok) {
+        for (const auto& [name, file] : inventory.state.files) {
+            if (file.persistState != 0) continue;
+            const char* hex = "0123456789abcdef"; std::string sha;
+            for (auto value : file.sha) { sha += hex[value >> 4]; sha += hex[value & 15]; }
+            auto bytes = LocalStorage::ReadFile(parsedAccountId, parsedAppId, name + "/" + sha);
+            if (bytes.empty() && file.size != 0) bytes = LocalStorage::ReadFile(parsedAccountId, parsedAppId, name);
+            if (bytes.size() != file.size || FileUtil::SHA1(bytes.data(), bytes.size()) != file.sha) { verified = false; break; }
+        }
+    }
 
     CloudStorage::Shutdown();
 
     return JsonObject({
-        {"success", JsonBool(drained)},
+        {"success", JsonBool(drained && verified)},
+        {"error", JsonString(verified ? "" : "Some saves were not restored or failed integrity verification. The recovery backup was preserved.")},
         {"had_newer", JsonBool(hadNewer)},
         {"drained", JsonBool(drained)},
         {"local_cn", JsonInt(static_cast<int64_t>(localCN))},
@@ -814,6 +861,11 @@ std::string CmdPublishFullManifest(const std::string& provider, const std::strin
         fe.size = me.size;
         state.files[name] = std::move(fe);
     }
+    if (!CloudStorage::VerifyAndHealManifestForPublish(parsedAccountId, parsedAppId, state)
+        || state.files.size() != localManifest.size()) {
+        CloudStorage::Shutdown();
+        return JsonError("Some save files could not be uploaded; the cloud inventory was not replaced.");
+    }
     bool manifestOk = CloudStorage::PublishCloudState(parsedAccountId, parsedAppId, state);
     bool cnOk = manifestOk;  // CN is included in state file
     bool drained = CloudWorkQueue::DrainQueueForApp(parsedAccountId, parsedAppId);
@@ -832,7 +884,12 @@ static std::string ReadSyncPath() {
     std::string configDir = GetConfigDir();
     if (configDir.empty()) return "";
 
-    FILE* f = fopen((configDir + "config.json").c_str(), "rb");
+    FILE* f = nullptr;
+#ifdef _WIN32
+    f = _wfopen(FileUtil::Utf8ToPath(configDir + "config.json").c_str(), L"rb");
+#else
+    f = fopen((configDir + "config.json").c_str(), "rb");
+#endif
     if (!f) return "";
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -1012,7 +1069,11 @@ std::string CmdScanAll(const std::string& provider) {
     out << "[";
     bool firstApp = true;
     for (const auto& acct : accountIds) {
-        auto appIds = prov->ListSubfolders(acct + "/");
+        std::vector<std::string> appIds;
+        if (!prov->ListSubfoldersChecked(acct + "/", appIds)) {
+            prov->Shutdown();
+            return JsonError("Failed to list apps for account " + acct);
+        }
         for (const auto& appId : appIds) {
             if (appId.empty() || appId == "0") continue;
             if (!firstApp) out << ",";
@@ -1295,7 +1356,7 @@ static void PrintUsage() {
     fprintf(stderr, "  gc-blobs <provider> <account_id> <app_id> <cloud_root>  Delete unreferenced SHA blobs from cloud\n");
     fprintf(stderr, "  scan-all <provider>                                       List all apps across all accounts (single-pass)\n");
     fprintf(stderr, "  migrate <src_provider> <dst_provider>                     Copy all cloud data from one provider to another\n");
-    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3, folder, webdav\n");
+    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3\n");
 }
 
 int RunCli(int argc, char** argv) {
@@ -1308,7 +1369,21 @@ int RunCli(int argc, char** argv) {
     const char* command = argv[2];
     std::string result;
     
-    if (strcmp(command, "auth-status") == 0) {
+    if (strcmp(command, "lua-directories") == 0) {
+#ifdef _WIN32
+        if (argc != 4) return 1;
+        auto values = Json::Array();
+        for (const auto& path : DolinLuaDirectories(argv[3])) values.arrVal.push_back(Json::String(path));
+        result = JsonObject({{"success", "true"}, {"directories", Json::Stringify(values)}});
+#else
+        result = JsonError("Not supported on this platform.");
+#endif
+    }
+    else if (strcmp(command, "backup-remote-app") == 0 || strcmp(command, "backup-delete-remote-app") == 0 || strcmp(command, "restore-remote-backup") == 0) {
+        if (argc != 7) { fprintf(stderr, "Error: recovery requires <provider> <account> <app> <directory>\n"); return 1; }
+        result = CmdDolinSnapshot(argv[3], argv[4], argv[5], argv[6], strcmp(command, "restore-remote-backup") == 0, strcmp(command, "backup-delete-remote-app") == 0);
+    }
+    else if (strcmp(command, "auth-status") == 0) {
         if (argc < 4) {
             fprintf(stderr, "Error: auth-status requires <provider>\n");
             return 1;
@@ -1447,8 +1522,13 @@ extern "C"
 __declspec(dllexport)
 #endif
 int CloudRedirect_CliMain(int argc, char** argv) {
+#ifndef _WIN32
+    Log::Init();
+#endif
     if (CloudRedirectCli::IsCliMode(argc, argv)) {
-        return CloudRedirectCli::RunCli(argc, argv);
+        int code = CloudRedirectCli::RunCli(argc, argv);
+        fflush(nullptr);
+        return code;
     }
     fprintf(stderr, "Usage: cloud_redirect_cli <command> [args...]\n");
     return 1;

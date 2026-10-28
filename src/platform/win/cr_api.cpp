@@ -14,6 +14,7 @@
 #include "http_server.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -70,6 +71,7 @@ bool CR_HandleCloudRpc(const char* method, uint32_t appId,
     if (!reqBody && reqLen > 0) return false;
 
     if (!CloudIntercept::IsNamespaceApp(appId)) return false;
+    const auto rpcStarted = std::chrono::steady_clock::now();
 
     if (accountId != 0 && CloudIntercept::GetAccountId() == 0) {
         CloudIntercept::SetAccountId(accountId);
@@ -120,7 +122,8 @@ bool CR_HandleCloudRpc(const char* method, uint32_t appId,
                 }).detach();
             }
             LOG("[CR_API] ExitSyncDone app=%u", appId);
-            StatsStore::EndSession(appId);
+            if (MetadataSync::syncPlaytime.load(std::memory_order_relaxed))
+                StatsStore::EndSession(appId);
         }
         *respLen = 0;
         *eresult = 1;
@@ -138,6 +141,10 @@ bool CR_HandleCloudRpc(const char* method, uint32_t appId,
     memcpy(respBuf, respData.data(), respData.size());
     *respLen = static_cast<uint32_t>(respData.size());
     *eresult = result->eresult;
+    LOG("[CR_API] %s app=%u: delivered %u bytes, result=%d, elapsed=%lldms",
+        method, appId, *respLen, *eresult,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - rpcStarted).count()));
     return true;
 }
 

@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <functional>
+#include "legacy_stats_inventory.h"
 
 namespace StatsStore {
 
@@ -19,9 +20,11 @@ using CloudPushAllFn =
 using CloudPullLegacyFn = std::function<std::string(uint32_t appId)>;
 // Read one legacy Playtime/<appId>.bin for migration recovery.
 using CloudPullLegacyPlaytimeFn = std::function<std::string(uint32_t appId)>;
+using CloudListLegacyFn = std::function<bool(LegacyStatsInventory::Inventory& out)>;
 void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll,
                       CloudPullLegacyFn pullLegacy = nullptr,
-                      CloudPullLegacyPlaytimeFn pullLegacyPlaytime = nullptr);
+                      CloudPullLegacyPlaytimeFn pullLegacyPlaytime = nullptr,
+                      CloudListLegacyFn listLegacy = nullptr);
 
 // Merge strategies for stat values (mirrors Steam's resolution_method + type_int).
 enum class StatMerge : uint8_t {

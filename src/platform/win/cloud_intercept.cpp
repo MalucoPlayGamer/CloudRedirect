@@ -1,3 +1,5 @@
+#include "file_util.h"
+#include "dolintools_compat.h"
 #include "cloud_intercept.h"
 #include "metadata_sync.h"
 #include "rpc_handlers.h"
@@ -8,6 +10,7 @@
 #include "parental_bypass.h"
 #include "steam_kv_injector.h"
 #include "sc_resolver.h"
+#include "protobuf_wrapper_layout.h"
 #include "sig_scanner.h"
 #include "log.h"
 #include "http_server.h"
@@ -108,9 +111,9 @@ static constexpr uintptr_t SC_RVA_BASYNC_SEND = 0xCF9590;
 static constexpr size_t SC_BAS_STOLEN_BYTES = 15;   // 5+5+1+4 bytes of prologue
 // CProtoBufMsg layout offsets
 static constexpr uint32_t CPROTOBUFMSG_OFF_DESC   = 0x08;  // typed-body descriptor vtable*
-static constexpr uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle
-static constexpr uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x20;  // uint32_t EMsg | PROTO_FLAG
-static constexpr uint32_t CPROTOBUFMSG_OFF_BODY   = 0x30;  // protobuf body object*
+static uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle
+static uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x20;  // uint32_t EMsg | PROTO_FLAG
+static uint32_t CPROTOBUFMSG_OFF_BODY   = 0x30;  // protobuf body object*
 
 // g_pJobCur (qword_1397E02C0): current CJob coroutine. CJobID at CJob+32.
 // Only valid on BMainLoop/job thread (yield primitives assert g_pJobCur != NULL).
@@ -226,11 +229,11 @@ using NotificationSlot7Fn = bool(__fastcall*)(void* thisptr, const char* methodN
 // Slot 8 signature: notification wrapper - extracts body from CProtoBufMsg, calls slot 7
 //   rcx = this (CClientUnifiedServiceTransport*)
 //   rdx = methodName (const char*)
-//   r8  = request CProtoBufMsg* (body/header 偏移运行时探测)
+//   r8  = request CProtoBufMsg* (body at +48, header at +40)
 using NotificationSlot8Fn = bool(__fastcall*)(void* thisptr, const char* methodName,
                                                void* request);
 // sub_138BD0210: ParseFromArray - fills a protobuf message object from raw bytes
-//   rcx = protobuf message object（body 对象取自 CProtoBufMsg，偏移运行时探测）
+//   rcx = protobuf message object (body at CProtoBufMsg+48)
 //   rdx = raw data pointer
 //   r8  = raw data size (as int)
 using ParseFromArrayFn = char(__fastcall*)(void* msgBody, const char* data, int size);
@@ -448,6 +451,8 @@ static volatile int64_t** g_refCountGlobalPtr = nullptr;  // &unk_139771AD8
 // Service-method vtable hook state (Approach E)
 static ServiceMethodSlot4Fn g_originalSlot4 = nullptr;      // saved original slot 4 function
 static ServiceMethodSlot5Fn g_originalSlot5 = nullptr;      // saved original slot 5 function
+static uint32_t g_serviceHeaderOffset = 40, g_serviceBodyOffset = 48;
+static std::atomic<bool> g_metadataLayoutReady{false};
 static NotificationSlot7Fn g_originalSlot7 = nullptr;       // saved original slot 7 function
 static NotificationSlot8Fn g_originalSlot8 = nullptr;       // saved original slot 8 function
 static ParseFromArrayFn g_parseFromArray = nullptr;          // sub_138BD0210
@@ -828,6 +833,13 @@ static uintptr_t FindCurrentUser() {
                     }
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) { userPtr = 0; }
+            if (userPtr) {
+                uint32_t account=0;
+                __try { account=*(uint32_t*)(userPtr+USER_OFF_ACCOUNTID); }
+                __except(EXCEPTION_EXECUTE_HANDLER) { account=0; }
+                const uint32_t known=PeekResolvedAccountId();
+                if (!account || (known && known!=account)) userPtr=0;
+            }
             if (userPtr) {
                 g_legacyUserLayout.store(true, std::memory_order_relaxed);
                 if (!g_findUserDiagOk.exchange(true, std::memory_order_relaxed))
@@ -1753,7 +1765,7 @@ static bool InjectLegacyUserStatsResponse(uint64_t jobIdTarget, uint32_t appId,
 // Feed synthesized GetLastPlayedTimes response to Steam's writer (sub_1389C7930).
 // Direct-write: NotifyLastPlayedTimes#1 isn't in GMapJobTypesByName. Net thread only.
 static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
-    if (!g_parseFromArray || respBody.empty()) return;
+    if (!g_metadataLayoutReady.load(std::memory_order_acquire) || !g_parseFromArray || respBody.empty()) return;
 
     uintptr_t pUser = FindCurrentUser();
     if (!pUser) {
@@ -1790,9 +1802,7 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
         wrapper[1] = descAddr;
         msgInit(wrapper);
 
-        // m_pProtoBufBody：1791 起在 +0x38（旧版 +0x30）。ctor 先清零，finalize 才写入。
-        uintptr_t inner = *(uintptr_t*)((uint8_t*)wrapper + 0x38);
-        if (!inner) inner = *(uintptr_t*)((uint8_t*)wrapper + 0x30);
+        uintptr_t inner = *(uintptr_t*)((uint8_t*)wrapper + g_serviceBodyOffset);
         if (!inner) {
             LOG("[Stats] ApplyLastPlayedUpdate: inner body alloc failed");
             msgDtor(wrapper);
@@ -1870,7 +1880,7 @@ const std::string& GetSteamPath() {
 }
 
 // Service-method vtable hook (Approach E): intercept Cloud RPCs via slot 4/5.
-// CProtoBufMsg 内 header/body 指针的偏移随 Steam 版本漂移，运行时探测（见 WrapperBodyOff）
+// CProtoBufMsg layout: +40 header*, +48 body*
 // CMsgProtoBufHeader: +16 has_bits, +24 appid, +116 routing_appid, +216 eresult, +220 error_code
 
 // Serialize a protobuf message body object to raw bytes
@@ -1985,53 +1995,6 @@ static bool SEH_WriteResponseHeader(void* respHeader, int32_t eresult = 1) {
         LOG("[VtHook] EXCEPTION writing response header: code=0x%08X", GetExceptionCode());
         return false;
     }
-}
-
-// CProtoBufMsg 内 header/body 指针的位置随 Steam 版本漂移：1791918634 上 body 在 +0x38
-// （更早的版本在 +0x30），这里不再写死偏移——首次处理 Cloud RPC 时按候选偏移试读并序列化，
-// 谁能解出非零 appId 谁就是真正的 body；探测结果本进程内常驻复用，header 恒为 body-8。
-static constexpr uint32_t CPB_BODY_OFF_NEW = 0x38;
-static constexpr uint32_t CPB_BODY_OFF_OLD = 0x30;
-static std::atomic<uint32_t> g_cpbBodyOff{0};
-
-// 读 CProtoBufMsg 的内部指针；布局不符时可能落到无效地址，交给 SEH 兜底返回空
-static void* SEH_ReadMsgField(void* msg, uint32_t off) {
-    __try {
-        return *(void**)((uintptr_t)msg + off);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-// 当前生效的 body 偏移：探测结果优先，尚未探测到时按新布局取
-static uint32_t WrapperBodyOff() {
-    uint32_t off = g_cpbBodyOff.load(std::memory_order_relaxed);
-    return off != 0 ? off : CPB_BODY_OFF_NEW;
-}
-
-// 探测 CProtoBufMsg 的 body 偏移；请求/响应共用同一布局，命中一次全局复用
-static bool ProbeWrapperBodyOff(const char* methodName, void* request,
-                                uint32_t* outOff, void** outBody, std::vector<uint8_t>* outBytes) {
-    static const uint32_t kCandidates[] = { CPB_BODY_OFF_NEW, CPB_BODY_OFF_OLD };
-    for (uint32_t off : kCandidates) {
-        void* candidate = SEH_ReadMsgField(request, off);
-        if (!candidate) continue;
-        // header 指针是结构约束：body 恒在 header 后 8 字节处。header/body 都
-        // 序列化得出 appId 时，光靠「非空 + appId」仍可能把 header 误认成 body，
-        // 补上 header 非空校验排除这类误读，避免缓存一个错误偏移。
-        if (!SEH_ReadMsgField(request, off - 8)) continue;
-        auto bytes = SerializeBodyToBytes(candidate);
-        if (bytes.empty()) continue;
-        auto fields = PB::Parse(bytes.data(), bytes.size());
-        if (CloudRpcUtils::ExtractAppId(methodName, fields) == 0) continue;
-        g_cpbBodyOff.store(off, std::memory_order_relaxed);
-        LOG("[VtHook] CProtoBufMsg layout: body at +0x%X (%zu bytes, probed)", off, bytes.size());
-        *outOff = off;
-        *outBody = candidate;
-        *outBytes = std::move(bytes);
-        return true;
-    }
-    return false;
 }
 
 // Shared Cloud RPC dispatch - routes a method name to the appropriate handler.
@@ -2272,14 +2235,11 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // 本次调用读取 CProtoBufMsg 用的 body 偏移（header = body-8）；未探测出时按新布局
-    uint32_t bodyOff = WrapperBodyOff();
-
     if (g_parentalBypassPlaytime.load() &&
         strcmp(methodName, "Parental.GetSignedParentalSettings#1") == 0) {
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         if (result && response) {
-            void* respBody = SEH_ReadMsgField(response, bodyOff);
+            void* respBody = *(void**)((uintptr_t)response + g_serviceBodyOffset);
             if (respBody) {
                 auto respBytes = SerializeBodyToBytes(respBody);
                 auto respFields = PB::Parse(respBytes.data(), respBytes.size());
@@ -2309,7 +2269,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             ? MetadataSync::schemaFetch.load(std::memory_order_relaxed)
             : MetadataSync::SchemaFetchEnabled())) {
         if (request && response) {
-            void* reqBody = SEH_ReadMsgField(request, bodyOff);
+            void* reqBody = *(void**)((uintptr_t)request + g_serviceBodyOffset);
             if (reqBody) {
                 auto reqBytes = SerializeBodyToBytes(reqBody);
                 auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2319,7 +2279,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                 LOG("[Stats] slot5 GetUserStats seen: app=%u namespace=%d", appId, IsNamespaceApp(appId) ? 1 : 0);
                 if (appId != 0 && IsNamespaceApp(appId)) {
                     auto res = StatsHandlers::HandleGetUserStats(appId, reqFields);
-                    void* respBody = SEH_ReadMsgField(response, bodyOff);
+                    void* respBody = *(void**)((uintptr_t)response + g_serviceBodyOffset);
                     if (respBody && res.body.Size() > 0 &&
                         ParseBytesToBody(respBody, res.body.Data().data(), res.body.Size())) {
                         if (flags) *flags = 0;
@@ -2328,7 +2288,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                         return true;
                     }
                     LOG("[Stats] GetUserStats app=%u NOT handled (respBody=%p bodySize=%zu) -> passthrough",
-                        appId, respBody, res.body.Size());
+                        appId, *(void**)((uintptr_t)response + g_serviceBodyOffset), res.body.Size());
                 }
             } else {
                 LOG("[Stats] slot5 GetUserStats: null reqBody -> passthrough");
@@ -2345,12 +2305,12 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         LOG("[Stats] slot5 GetLastPlayedTimes seen: serverResult=%d", result ? 1 : 0);
         if (result && response) {
-            void* respBody = SEH_ReadMsgField(response, bodyOff);
+            void* respBody = *(void**)((uintptr_t)response + g_serviceBodyOffset);
             if (respBody) {
                 // Parse the request to honor min_last_played.
                 std::vector<PB::Field> reqFields;
                 if (request) {
-                    void* reqBody = SEH_ReadMsgField(request, bodyOff);
+                    void* reqBody = *(void**)((uintptr_t)request + g_serviceBodyOffset);
                     if (reqBody) {
                         auto reqBytes = SerializeBodyToBytes(reqBody);
                         reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2417,21 +2377,15 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // 取请求体：偏移未探测出时按候选偏移探测一次，探测失败直接放行
-    void* reqBody = nullptr;
-    std::vector<uint8_t> reqBytes;
-    if (g_cpbBodyOff.load(std::memory_order_relaxed) != 0) {
-        reqBody = SEH_ReadMsgField(request, bodyOff);
-        if (reqBody) reqBytes = SerializeBodyToBytes(reqBody);
-    } else if (!ProbeWrapperBodyOff(methodName, request, &bodyOff, &reqBody, &reqBytes)) {
-        LOG("[VtHook] %s: CProtoBufMsg layout unresolved, passing through", methodName);
+    // Extract the request body from CProtoBufMsg+48
+    void* reqBody = *(void**)((uintptr_t)request + g_serviceBodyOffset);
+    if (!reqBody) {
+        LOG("[VtHook] %s: request body is NULL, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    if (reqBytes.empty()) {
-        LOG("[VtHook] %s: request body empty (bodyOff=0x%X), passing through", methodName, bodyOff);
-        return g_originalSlot5(thisptr, methodName, request, response, flags);
-    }
+    // Serialize request body to raw protobuf bytes
+    auto reqBytes = SerializeBodyToBytes(reqBody);
     LOG("[VtHook] %s: request body %zu bytes", methodName, reqBytes.size());
 
     // Parse the raw bytes to get fields
@@ -2467,7 +2421,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             bool spyResult = g_originalSlot5(thisptr, methodName, request, response, flags);
             // Inspect the response body only on success: a failed call may leave the
             // body slot without a constructed message.
-            void* spyRespBody = spyResult ? SEH_ReadMsgField(response, bodyOff) : nullptr;
+            void* spyRespBody = spyResult ? *(void**)((uintptr_t)response + g_serviceBodyOffset) : nullptr;
             if (spyRespBody) {
                 auto respBytes = SerializeBodyToBytes(spyRespBody);
                 LOG("[SPY] %s app=%u native response (%zu bytes, result=%d):",
@@ -2494,7 +2448,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Capture SteamID from the request header. Detects account switches.
     if (!g_steamIdFromHeader.load()) {
-        void* reqHeader = SEH_ReadMsgField(request, bodyOff - 8);
+        void* reqHeader = *(void**)((uintptr_t)request + g_serviceHeaderOffset);
         if (reqHeader) {
             auto hdrBytes = SerializeBodyToBytes(reqHeader);
             if (!hdrBytes.empty()) {
@@ -2560,14 +2514,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Validate response header BEFORE writing body to avoid corrupting the
     // response protobuf object on a failure path.
-    void* respHeader = SEH_ReadMsgField(response, bodyOff - 8);
+    void* respHeader = *(void**)((uintptr_t)response + g_serviceHeaderOffset);
     if (!respHeader) {
         LOG("[VtHook] %s: respHeader is NULL, cannot deliver response", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
     // Write the response body into the response CProtoBufMsg
-    void* respBody = SEH_ReadMsgField(response, bodyOff);
+    void* respBody = *(void**)((uintptr_t)response + g_serviceBodyOffset);
     if (!respBody) {
         LOG("[VtHook] %s: response body object is NULL, cannot write response!", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
@@ -2580,7 +2534,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         }
     }
 
-    // 写 eresult 进响应 header（header = bodyOff-8，其内部字段偏移不受外层布局变化影响）:
+    // Write eresult into response header (CProtoBufMsg+40):
     //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (error_message)
     //   header+216 = eresult, header+220 = error_code
     if (!SEH_WriteResponseHeader(respHeader, result.eresult)) {
@@ -2641,7 +2595,7 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
 }
 
 // Slot 8 hook - Notification wrapper (e.g. SignalAppExitSyncDone)
-// request 是 CProtoBufMsg*，body/header 偏移运行时探测（见 WrapperBodyOff）
+// request is a CProtoBufMsg* with body at +48, header at +40
 static bool __fastcall NotificationWrapperHook(void* thisptr, const char* methodName, void* request) {
     HookGuard guard;
     if (g_shuttingDown.load(std::memory_order_acquire))
@@ -2650,12 +2604,9 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
-    // body/header 偏移运行时探测的结果，本函数只读
-    const uint32_t bodyOff = WrapperBodyOff();
-
     if (ParentalBypass::IsParentalNotification(methodName) && g_parentalBypassPlaytime.load()) {
         if (request) {
-            void* bodyObj = SEH_ReadMsgField(request, bodyOff);
+            void* bodyObj = *(void**)((uintptr_t)request + g_serviceBodyOffset);
             if (bodyObj && strcmp(methodName, ParentalBypass::NOTIFY_SETTINGS_CHANGE) == 0) {
                 auto bodyBytes = SerializeBodyToBytes(bodyObj);
                 auto notifFields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -2693,8 +2644,8 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
-    // 取通知体（body 偏移运行时探测）
-    void* bodyObj = SEH_ReadMsgField(request, bodyOff);
+    // Extract body from CProtoBufMsg+48
+    void* bodyObj = *(void**)((uintptr_t)request + g_serviceBodyOffset);
     uint32_t realAppId = CheckNotificationNamespaceApp(methodName, bodyObj);
 
     if (realAppId == 0) {
@@ -2960,8 +2911,6 @@ static uintptr_t ResolveServiceTransportVtableViaRtti(uintptr_t scBase) {
     return vtEa;
 }
 
-// One-shot warning when the vtable hook can't be installed; modal dialog on detached thread.
-static std::atomic<bool> g_vtableHookFailureNotified{false};
 static void RefuseVtableHook(const char* reasonFmt, ...) {
     char reason[512];
     va_list ap;
@@ -2970,41 +2919,6 @@ static void RefuseVtableHook(const char* reasonFmt, ...) {
     va_end(ap);
 
     LOG("[VtHook] REFUSED: %s", reason);
-
-    if (g_vtableHookFailureNotified.exchange(true)) return;
-
-    uint64_t ver = g_detectedSteamVersion.load(std::memory_order_relaxed);
-    char msg[1024];
-    if (ver != 0) {
-        snprintf(msg, sizeof(msg),
-            "Your Steam client (version %llu) is newer than what "
-            "CloudRedirect supports.\n\n"
-            "Update CloudRedirect to match your Steam version.\n\n"
-            "Cloud saves will not be redirected. STFixer patches will still apply.\n\n"
-            "Reason: %s",
-            ver, reason);
-    } else {
-        snprintf(msg, sizeof(msg),
-            "CloudRedirect could not identify required addresses in "
-            "steamclient64.dll.\n\n"
-            "Update CloudRedirect to match your Steam version.\n\n"
-            "Cloud saves will not be redirected. STFixer patches will still apply.\n\n"
-            "Reason: %s",
-            reason);
-    }
-    std::string msgStr(msg);
-    std::thread t([msgStr]() {
-        if (g_shuttingDown.load(std::memory_order_acquire)) return;
-        MessageBoxA(nullptr, msgStr.c_str(),
-            "CloudRedirect -- Incompatible Steam Update",
-            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-    });
-    std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
-    if (g_shuttingDown.load(std::memory_order_acquire)) {
-        t.detach();
-    } else {
-        g_bgThreads.push_back(std::move(t));
-    }
 }
 
 // Lock-free body; caller must hold s_installMutex (declared in InstallServiceMethodHook).
@@ -3190,6 +3104,25 @@ static void InstallServiceMethodHookLocked() {
             (void*)currentSlot5, (void*)vtableSlot5Addr);
         return;
     }
+    ProtobufWrapperLayout::Layout wrapperLayout;
+    bool knownWrapper = false;
+    __try {
+        knownWrapper = ProtobufWrapperLayout::Detect(reinterpret_cast<const uint8_t*>(currentSlot5), 192, wrapperLayout);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { knownWrapper = false; }
+    if (!knownWrapper) {
+        RefuseVtableHook("unrecognized transport wrapper layout -- refusing guessed offsets");
+        return;
+    }
+    g_serviceHeaderOffset = wrapperLayout.header;
+    g_serviceBodyOffset = wrapperLayout.body;
+    ProtobufWrapperLayout::Metadata metadata;
+    if (ProtobufWrapperLayout::MetadataFor(wrapperLayout,metadata)) {
+        CPROTOBUFMSG_OFF_BODY = wrapperLayout.body;
+        CPROTOBUFMSG_OFF_CONN = metadata.connection;
+        CPROTOBUFMSG_OFF_EMSG = metadata.message;
+        g_metadataLayoutReady.store(true,std::memory_order_release);
+    }
+    LOG("[VtHook] Decoded transport wrapper: header=+%u body=+%u", g_serviceHeaderOffset, g_serviceBodyOffset);
     g_originalSlot5 = currentSlot5;
     LOG("[VtHook] Original slot 5: %p (RVA=0x%llX)",
         (void*)currentSlot5, (uint64_t)((uintptr_t)currentSlot5 - g_steamClientBase));
@@ -3581,7 +3514,7 @@ struct SyncState {
 };
 
 static std::string GetLuaSyncStatePath() {
-    return g_steamPath + "config\\stplug-in\\.sync_state";
+    return DolinLuaPrimary(g_steamPath) + ".sync_state";
 }
 
 [[maybe_unused]] static SyncState ReadSyncState() {
@@ -3622,6 +3555,7 @@ static void WriteSyncState(uint64_t syncTime, const std::unordered_set<std::stri
 
 struct LuaFile {
     std::string filename;           // e.g. "1229490.lua"
+    std::string sourcePath;         // Preserve the configured directory when multiple Lua paths are active.
     std::vector<uint8_t> content;
     uint64_t modTime;               // file modification time (unix seconds)
 };
@@ -3663,17 +3597,18 @@ static bool IsValidLuaContent(const uint8_t* data, size_t len) {
 
 static std::vector<LuaFile> ReadLocalLuaFiles() {
     std::vector<LuaFile> files;
-    std::string dir = g_steamPath + "config\\stplug-in\\";
+    std::unordered_set<std::string> seen;
+    for (const auto& dir : DolinLuaDirectories(g_steamPath)) {
     // Wide enumeration; ANSI would return 8.3 short names for non-Latin-1
     // filenames and rotate them into different lua records every launch.
     auto dirWide = FileUtil::Utf8ToPath(dir).wstring();
     std::wstring pattern = dirWide + L"*.lua";
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return files;
+    if (hFind == INVALID_HANDLE_VALUE) continue;
     do {
         std::string name = FileUtil::WideToUtf8(fd.cFileName);
-        if (name.empty()) continue;
+        if (name.empty() || seen.count(name) || (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) continue;
         std::string path = dir + name;
         std::ifstream f(FileUtil::Utf8ToPath(path), std::ios::binary | std::ios::ate);
         if (!f.is_open()) continue;
@@ -3681,6 +3616,7 @@ static std::vector<LuaFile> ReadLocalLuaFiles() {
         if (size <= 0 || size > 10 * 1024 * 1024) continue; // 10 MB per-file limit
         LuaFile lf;
         lf.filename = name;
+        lf.sourcePath = path;
         lf.content.resize(static_cast<size_t>(size));
         f.seekg(0);
         f.read(reinterpret_cast<char*>(lf.content.data()), size);
@@ -3696,9 +3632,11 @@ static std::vector<LuaFile> ReadLocalLuaFiles() {
         uli.LowPart = fd.ftLastWriteTime.dwLowDateTime;
         uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
         lf.modTime = (uli.QuadPart - 116444736000000000ULL) / 10000000ULL;
+        seen.insert(name);
         files.push_back(std::move(lf));
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
+    }
     return files;
 }
 
@@ -3801,7 +3739,7 @@ static void SyncLuaFiles() {
         return;
     }
 
-    std::string luaDir = g_steamPath + "config\\stplug-in\\";
+    std::string luaDir = DolinLuaPrimary(g_steamPath);
     uint64_t now = NowUnix();
 
     auto manifestData = CloudStorage::RetrieveBlob(accountId, LUA_SYNC_APPID, "LuaManifest.json");
@@ -3923,7 +3861,7 @@ static void SyncLuaFiles() {
                 if (dot != std::string::npos) {
                     uint32_t appId = (uint32_t)strtoul(lf.filename.substr(0, dot).c_str(), nullptr, 10);
                     if (appId) {
-                        std::string luaPath = g_steamPath + "config\\stplug-in\\" + lf.filename;
+                        std::string luaPath = lf.sourcePath;
                         if (IsSelfUnlockingLua(luaPath, appId))
                             AddNamespaceApp(appId);
                     }
@@ -4237,7 +4175,7 @@ static void TryAutoUpdateDll() {
 
     // Fetch releases from GitHub
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect-AutoUpdate/1.0",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
         LOG("[AutoUpdate] WinHttpOpen failed: %u", GetLastError());
@@ -4581,9 +4519,11 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     }
 
     // Auto-detect namespace apps from {steamPath}\config\stplug-in\*.lua, restricted to self-unlocking luas (base-game addappid for own id).
-    std::string pluginDir = g_steamPath + "config\\stplug-in\\*";
-    std::string pluginBase = g_steamPath + "config\\stplug-in\\";
     int totalLuas = 0, selfUnlocking = 0;
+    for (const auto& luaBase : DolinLuaDirectories(g_steamPath)) {
+    std::string pluginDir = luaBase + "*";
+    std::string pluginBase = luaBase;
+
     // Wide enumeration; FindFirstFileA fails on non-ASCII g_steamPath.
     auto pluginDirWide = FileUtil::Utf8ToPath(pluginDir).wstring();
     WIN32_FIND_DATAW fd;
@@ -4615,6 +4555,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     } else {
         LOG("[NS] Failed to scan stplug-in directory: %s (err=%u)",
             pluginDir.c_str(), GetLastError());
+    }
+
+
     }
 
     if (HasNamespaceApps()) {
@@ -4666,7 +4609,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             // Load lua setManifestid pins (when auto_comment=false or app
             // is in pinned_apps). Wide enumeration for non-ASCII paths.
             if (g_manifestPinsEnabled.load()) {
-                std::string luaDir = g_steamPath + "config\\stplug-in\\";
+                std::string luaDir = DolinLuaPrimary(g_steamPath);
                 auto luaDirWide = FileUtil::Utf8ToPath(luaDir).wstring();
                 std::wstring pattern = luaDirWide + L"*.lua";
                 WIN32_FIND_DATAW fd;
@@ -4954,7 +4897,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
                         std::string name = provider->Name();
                         std::string notifMsg = name + " is configured but you haven't signed in yet.\n\n"
                             "Your saves will be stored locally but will NOT sync to the cloud.\n\n"
-                            "Open the CloudRedirect app and sign in on the Cloud Provider page.";
+                            "Open DolinTools, Cloud Saves, and connect your account on the Provider tab.";
                         std::thread t([notifMsg]() {
                             NotifyUser(CR_NOTIFY_WARN,
                                 "CloudRedirect - Cloud Provider Not Authenticated",
@@ -4991,8 +4934,8 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
                     std::memory_order_relaxed);
         }
 
-        // Lua sync requires SteamTools.
-        if (MetadataSync::steamToolsPresent.load(std::memory_order_relaxed)) {
+        // GreenTools/OpenSteamTool supply the same Lua namespace in third-party mode.
+        if (cloudSaveOnly || MetadataSync::steamToolsPresent.load(std::memory_order_relaxed)) {
             if (cfg["sync_luas"].type == Json::Type::Bool)
                 MetadataSync::syncLuas = cfg["sync_luas"].boolean();
         }
@@ -5141,6 +5084,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             if (CloudStorage::DownloadLegacyPlaytimeBlob(accountId, appId, data))
                 return std::string(reinterpret_cast<const char*>(data.data()), data.size());
             return std::string();
+        },
+        [](LegacyStatsInventory::Inventory& out) -> bool {
+            return CloudStorage::ListLegacyStatsMetadata(CloudIntercept::GetAccountId(),out);
         });
     // Restrict all playtime/stats tracking to namespace/lua apps only -- real
     // owned games must never have their playtime recorded or synced.
@@ -5907,6 +5853,8 @@ static void MaybeScheduleSchemaSweep() {
 }
 
 static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
+    if (!g_metadataLayoutReady.load(std::memory_order_acquire))
+        return reinterpret_cast<BAsyncSendFn>(g_basOriginal)(pMsg,connHandle);
     // Capture CM connection handle for schema-fetch injection.
     if (connHandle && pMsg) {
         // Prefer the conn from Steam's own GetUserStats (818 -> 819 reply path).
@@ -5917,7 +5865,7 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         }
         // Capture session fields from any outgoing message for injected 818s.
         if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
-            void* ownHdr = *(void**)((uintptr_t)pMsg + 0x28);
+            void* ownHdr = *(void**)((uintptr_t)pMsg + g_serviceHeaderOffset);
             if (ownHdr) {
                 uint8_t* hb = (uint8_t*)ownHdr;
                 uint64_t sid = *(uint64_t*)(hb + 104);
@@ -6147,7 +6095,7 @@ static bool AppSupportsAchievements(uint32_t appId) {
     swprintf_s(path, L"/api/appdetails?appids=%u&filters=categories", appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return true;  // fail-open
     WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);
@@ -6214,7 +6162,7 @@ static std::vector<uint64_t> FetchReviewOwnerIds(uint32_t appId) {
                L"&purchase_type=all&num_per_page=20", appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return ids;
     WinHttpSetTimeouts(hSession, 3000, 3000, 5000, 5000);
@@ -6283,7 +6231,7 @@ static bool HasPublicStats(uint32_t appId, uint64_t steamId) {
                (unsigned long long)steamId, appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);
@@ -6326,7 +6274,7 @@ static bool HasPublicStats(uint32_t appId, uint64_t steamId) {
 // Build and send one CMsgClientGetUserStats for (appId, ownerId). Returns false
 // if injection primitives aren't ready or send failed to dispatch.
 static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHandle) {
-    if (!g_pbMsgCtor || !g_pbMsgFinalize || !g_pbMsgCleanup ||
+    if (!g_metadataLayoutReady.load(std::memory_order_acquire) || !g_pbMsgCtor || !g_pbMsgFinalize || !g_pbMsgCleanup ||
         !g_getUserStatsDesc || !g_getUserStatsVtbl || !g_parseFromArray)
         return false;
 
@@ -6346,7 +6294,7 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     //  2. Session fields (steamid, sessionid, realm, jobid_source): CM drops without.
     // Offsets: +104 steamid, +112 sessionid, +156 realm, +208 jobid_source
     static std::atomic<uint64_t> s_jobIdCounter{0x5C00000000000001ull};
-    if (void* hdr = *(void**)(msg + 0x28)) {
+    if (void* hdr = *(void**)(msg + g_serviceHeaderOffset)) {
         uint8_t* h = (uint8_t*)hdr;
         *(int32_t*)(h + 192) = -1;                         // expiry = -1 (no deadline)
         *(uint32_t*)(h + 16) &= ~0x4000000u;               // clear "no reply expected"
