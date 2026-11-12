@@ -28,14 +28,16 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      - name: Configure CMake
-        run: cmake -S . -B build -A x64
+      - name: Configure CMake with Ninja Multi-Config
+        run: cmake -S . -B build -G "Ninja Multi-Config"
 
       - name: Build C++ and .NET UI
-        run: cmake --build build --config Release --target ui --parallel
+        run: cmake --build build --config Release --target ui
 
       - name: Prepare Assets & Hashes
         shell: pwsh
