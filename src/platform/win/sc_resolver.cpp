@@ -522,23 +522,62 @@ static uintptr_t ResolveKvGetUint64(uintptr_t /*kvFindKeyAddr*/) {
 }
 
 // ── GetAppInfo, GetSection, ReadConfigU64 ─────────────────────────────
-// GetAppInfo has a distinctive prologue: mov r8d,[rcx+68h]; mov r9d,edx; cmp r8d,0FFFFFFFFh
-//   44 8B 41 68  44 8B CA  41 83 F8 FF
+// GetAppInfo prologue:
+//   Legacy builds:  mov r8d,[rcx+68h]; mov r9d,edx; cmp r8d,0FFFFFFFFh (44 8B 41 68 44 8B CA 41 83 F8 FF)
+//   Current builds: mov r8d,[rcx+28h]; mov r9d,edx; cmp r8d,0FFFFFFFFh (44 8B 41 28 44 8B CA 41 83 F8 FF 74 4E)
 static uintptr_t ResolveGetAppInfo() {
-    static const uint8_t pat[] = {
+    // Strategy 1: Legacy builds (offset +68h)
+    static const uint8_t patLegacy[] = {
         0x44, 0x8B, 0x41, 0x68,       // mov r8d, [rcx+68h]
         0x44, 0x8B, 0xCA,             // mov r9d, edx
         0x41, 0x83, 0xF8, 0xFF,       // cmp r8d, 0FFFFFFFFh
     };
-    static const char mask[] = "xxxxxxxxxxx";
-
-    uintptr_t result = SigScanner::FindPattern(pat, mask, 11);
-    if (result)
-        LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via signature",
+    uintptr_t result = SigScanner::FindPattern(patLegacy, "xxxxxxxxxxx", 11);
+    if (result) {
+        LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via legacy signature",
             (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
-    else
-        LOG("[Resolver] GetAppInfo: signature not found");
-    return result;
+        return result;
+    }
+
+    // Strategy 2: Current builds (offset +28h)
+    static const uint8_t patCurrent[] = {
+        0x44, 0x8B, 0x41, 0x28,       // mov r8d, [rcx+28h]
+        0x44, 0x8B, 0xCA,             // mov r9d, edx
+        0x41, 0x83, 0xF8, 0xFF,       // cmp r8d, 0FFFFFFFFh
+        0x74, 0x4E,                   // jz ...
+    };
+    result = SigScanner::FindPattern(patCurrent, "xxxxxxxxxxxxx", 13);
+    if (result) {
+        LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via current signature",
+            (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
+        return result;
+    }
+
+    // Strategy 3: Derive from ReadConfigU64 call site (ReadConfigU64 always calls GetAppInfo at offset 0x10)
+    static const uint8_t patReadConfig[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
+        0x57,                          // push rdi
+        0x48, 0x83, 0xEC, 0x20,        // sub rsp, 20h
+        0x49, 0x8B, 0xD9,             // mov rbx, r9
+        0x41, 0x8B, 0xF8,             // mov edi, r8d
+    };
+    uintptr_t rc = SigScanner::FindPattern(patReadConfig, "xxxxxxxxxxxxxxxx", 16);
+    if (rc) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(rc);
+        if (p[16] == 0xE8) {
+            int32_t rel = *reinterpret_cast<const int32_t*>(p + 17);
+            uintptr_t target = rc + 16 + 5 + rel;
+            if (target >= SigScanner::GetTextBase() &&
+                target < SigScanner::GetTextBase() + SigScanner::GetTextSize()) {
+                LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via ReadConfigU64 call",
+                    (void*)target, (uint64_t)(target - SigScanner::GetImageBase()));
+                return target;
+            }
+        }
+    }
+
+    LOG("[Resolver] GetAppInfo: all strategies failed");
+    return 0;
 }
 
 // GetSection: sub rsp,28h; lea eax,[edx-2]; cmp eax,12h
@@ -680,10 +719,17 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.getAppInfo = ResolveGetAppInfo();
     uint32_t appInfoCacheOff = DetectAppInfoCacheOffset(r.getAppInfo);
     if (!appInfoCacheOff) {
-        LOG("[Resolver] AppInfoCache offset unresolved; KV injection disabled (no guessed fallback)");
+        appInfoCacheOff = 0x1290;
+        r.globalEngine = ResolveGlobalEngine(steamClientBase, appInfoCacheOff);
+        if (!r.globalEngine) {
+            appInfoCacheOff = 0xE68;
+            r.globalEngine = ResolveGlobalEngine(steamClientBase, appInfoCacheOff);
+        }
+        LOG("[Resolver] AppInfoCache offset: falling back to 0x%X", appInfoCacheOff);
+    } else {
+        r.globalEngine = ResolveGlobalEngine(steamClientBase, appInfoCacheOff);
     }
     r.engineOffAppInfoCache = appInfoCacheOff;
-    r.globalEngine = appInfoCacheOff ? ResolveGlobalEngine(steamClientBase, appInfoCacheOff) : 0;
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -998,6 +1044,15 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     // Phase 16: RTTI vtables for protobuf message wrappers
     r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
         ".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@");
+    if (!r.getUserStatsVtable) {
+        // Newer Steam builds don't instantiate CProtoBufMsg<CMsgClientGetUserStats>.
+        // Fall back to another identical CProtoBufMsg vtable.
+        r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
+            ".?AV?$CProtoBufMsg@VCMsgClientStoreUserStatsResponse@@@@");
+        if (!r.getUserStatsVtable)
+            r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
+                ".?AV?$CProtoBufMsg@VCPlayer_GetLastPlayedTimes_Response@@@@");
+    }
     if (r.getUserStatsVtable)
         LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) via RTTI",
             (void*)r.getUserStatsVtable, (uint64_t)(r.getUserStatsVtable - steamClientBase));
@@ -1129,7 +1184,7 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
 }
 
 void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
-    LOG("[Resolver] === Resolution diagnostics (historical RVAs are informational) ===");
+    LOG("[Resolver] === Comparison (resolved RVA vs expected) ===");
 
     int total = 0, matched = 0, failed = 0;
     auto logEntry = [&](const char* name, uintptr_t resolved, uintptr_t expectedRva) {
@@ -1139,7 +1194,7 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
             bool match = (resolvedRva == expectedRva);
             if (match) matched++;
             LOG("[Resolver]   %-30s 0x%llX  %s",
-                name, (uint64_t)resolvedRva, match ? "RESOLVED (historical address)" : "RESOLVED (address changed)");
+                name, (uint64_t)resolvedRva, match ? "OK" : "MISMATCH");
         } else {
             failed++;
             LOG("[Resolver]   %-30s FAILED (expected 0x%llX)", name, (uint64_t)expectedRva);
@@ -1183,7 +1238,7 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     logEntry("RespDescriptor",         r.respDescriptor,          0x16D5590);
     logEntry("RegKeySyncTime",         r.regKeySyncTime,          0x16E8248);
 
-    LOG("[Resolver] Result: %d historical matches / %d addresses, %d unresolved", matched, total, failed);
+    LOG("[Resolver] Result: %d/%d matched, %d failed", matched, total, failed);
 }
 
 } // namespace ScResolver
