@@ -3517,7 +3517,7 @@ static std::string GetLuaSyncStatePath() {
     return DolinLuaPrimary(g_steamPath) + ".sync_state";
 }
 
-[[maybe_unused]] static SyncState ReadSyncState() {
+static SyncState ReadSyncState() {
     SyncState state;
     std::ifstream f(FileUtil::Utf8ToPath(GetLuaSyncStatePath()));
     if (!f.is_open()) return state;
@@ -3823,15 +3823,26 @@ static void SyncLuaFiles() {
     int extracted = 0, addedToCloud = 0;
     bool manifestChanged = false;
 
-    // Extract cloud luas missing locally; never delete or tombstone.
+    auto syncState = ReadSyncState();
+
+    // Extract cloud luas missing locally (unless already deleted on this machine).
     for (auto& [filename, entry] : cloudManifest) {
         if (!IsValidLuaFilename(filename)) {
             LOG("[LuaSync] Skipping invalid manifest entry: %s", filename.c_str());
             continue;
         }
+        if (entry.isDeleted()) continue;
         bool onDisk = localByName.count(filename) > 0;
+        bool inSyncState = syncState.files.count(filename) > 0;
 
         if (!onDisk) {
+            if (inSyncState) {
+                // Was previously synced on this PC, but is now gone -> deleted by user!
+                entry.del = now;
+                manifestChanged = true;
+                LOG("[LuaSync] Local deletion detected at startup: %s", filename.c_str());
+                continue;
+            }
             auto it = cloudFiles.find(filename);
             if (it != cloudFiles.end()) {
                 std::error_code ec;
@@ -3905,11 +3916,12 @@ static void SyncLuaFiles() {
         std::vector<LuaFile> archiveFiles;
         archiveFiles.reserve(unionFiles.size());
         for (auto& [filename, content] : unionFiles) {
-            if (cloudManifest.count(filename) == 0) continue;
+            auto it = cloudManifest.find(filename);
+            if (it == cloudManifest.end() || it->second.isDeleted()) continue;
             LuaFile lf;
             lf.filename = filename;
             lf.content = content;
-            lf.modTime = cloudManifest[filename].mod;
+            lf.modTime = it->second.mod;
             archiveFiles.push_back(std::move(lf));
         }
 
@@ -3978,18 +3990,33 @@ static void UploadLuaOnShutdown() {
         }
     }
 
+    auto syncState = ReadSyncState();
     auto localFiles = ReadLocalLuaFiles();
     std::unordered_map<std::string, uint64_t> localByName;
     for (auto& lf : localFiles) localByName[lf.filename] = lf.modTime;
 
     bool changed = false;
 
-    // Add new local files to the manifest; never tombstone.
+    // Detect files deleted locally that this machine had synced
+    for (auto& [filename, entry] : cloudManifest) {
+        if (!entry.isDeleted() && localByName.count(filename) == 0 && syncState.files.count(filename) > 0) {
+            entry.del = now;
+            changed = true;
+            LOG("[LuaSync] Shutdown: marking deleted locally: %s", filename.c_str());
+        }
+    }
+
+    // Add new local files or revive re-added ones
     for (auto& [filename, modTime] : localByName) {
         auto it = cloudManifest.find(filename);
         if (it == cloudManifest.end()) {
             cloudManifest[filename] = { modTime, 0 };
             changed = true;
+        } else if (it->second.isDeleted()) {
+            it->second.mod = modTime;
+            it->second.del = 0;
+            changed = true;
+            LOG("[LuaSync] Shutdown: revived local file: %s", filename.c_str());
         }
     }
 
